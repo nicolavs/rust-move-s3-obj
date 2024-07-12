@@ -9,20 +9,23 @@ struct Task {
     work: u32,
 }
 
+const NUM_WORKERS: u32 = 2;
+
 #[tokio::main]
 async fn main() {
     // Create a broadcast channel
     let (tx, _) = broadcast::channel(32);
 
     // Spawn worker tasks
-    let num_workers = 4;
-    for worker_id in 0..num_workers {
+    let mut handles = vec![];
+    for worker_id in 0..NUM_WORKERS {
         let mut rx = tx.subscribe();
-        task::spawn(async move {
+        let h = task::spawn(async move {
             while let Ok(task) = rx.recv().await {
                 process_task(worker_id, task).await;
             }
         });
+        handles.push(h);
     }
 
     // Send tasks to workers
@@ -35,7 +38,9 @@ async fn main() {
     drop(tx);
 
     // Wait for a moment to allow workers to finish
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    for h in handles {
+        h.await.unwrap()
+    }
 }
 
 async fn process_task(worker_id: u32, task: Task) {
