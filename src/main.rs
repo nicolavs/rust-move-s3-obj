@@ -83,7 +83,7 @@ async fn main() {
         }
     });
 
-    let mut handles = vec![];
+    let mut handles = Vec::with_capacity(args.num_workers as usize);
     for _ in 0..args.num_workers {
         let mut rx = tx.subscribe();
         let s3_client = Client::new(&config);
