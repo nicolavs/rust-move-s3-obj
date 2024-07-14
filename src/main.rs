@@ -1,24 +1,62 @@
-use tokio::sync::broadcast;
+use aws_config;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::Client;
+use aws_types::region::Region;
+use clap::Parser;
+use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
-use std::time::Duration;
+
+use s3_helper::list_objects;
+
+mod s3_helper;
+
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    #[clap(long, value_parser)]
+    source_bucket: String,
+
+    #[clap(long, value_parser, default_value = "")]
+    source_path: String,
+
+    #[clap(long, value_parser)]
+    destination_path: String,
+
+    #[clap(long, value_parser)]
+    destination_bucket: Option<String>,
+
+    #[clap(short, long, value_parser, default_value = "ap-southeast-2")]
+    region_id: String,
+
+    #[clap(short, long, value_parser, default_value_t = 1)]
+    num_workers: u8,
+}
 
 // Define a task type
 #[derive(Debug, Clone)] // Add Clone derive
 struct Task {
-    id: u32,
-    work: u32,
+    item: String,
+    source_bucket: String,
+    destination_path: String,
+    destination_bucket: String,
 }
-
-const NUM_WORKERS: u32 = 2;
 
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+
+    let destination_bucket = args
+        .destination_bucket
+        .unwrap_or(args.source_bucket.clone());
+
     // Create a broadcast channel
-    let (tx, _) = broadcast::channel(32);
+    let (tx, _) = broadcast::channel(100);
+    let (item_tx, mut item_rx): (Sender<String>, Receiver<String>) = mpsc::channel(100);
 
     // Spawn worker tasks
     let mut handles = vec![];
-    for worker_id in 0..NUM_WORKERS {
+    for worker_id in 0..args.num_workers {
         let mut rx = tx.subscribe();
         let h = task::spawn(async move {
             while let Ok(task) = rx.recv().await {
@@ -28,9 +66,34 @@ async fn main() {
         handles.push(h);
     }
 
+    // Initialize the AWS SDK for Rust
+    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        .region(Region::new(args.region_id))
+        .load()
+        .await;
+    let s3_client = Client::new(&config);
+
+    // List item in S3 bucket
+    list_objects(
+        &s3_client,
+        &args.source_bucket,
+        Some(&args.source_path),
+        item_tx.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Close the channel by dropping the sender
+    drop(item_tx);
+
     // Send tasks to workers
-    for i in 0..20 {
-        let task = Task { id: i, work: i * 100 };
+    while let Some(item) = item_rx.recv().await {
+        let task = Task {
+            item,
+            source_bucket: args.source_bucket.clone(),
+            destination_path: args.destination_path.clone(),
+            destination_bucket: destination_bucket.clone(),
+        };
         tx.send(task).unwrap();
     }
 
@@ -43,9 +106,7 @@ async fn main() {
     }
 }
 
-async fn process_task(worker_id: u32, task: Task) {
-    println!("Worker {} processing task {:?}", worker_id, task);
-    // Simulate some work
-    tokio::time::sleep(Duration::from_millis(task.work as u64)).await;
-    println!("Worker {} completed task {}", worker_id, task.id);
+async fn process_task(worker_id: u8, task: Task) {
+    println!("Worker {} processing item {}", worker_id, &task.item);
+    println!("Worker {} completed item {}", worker_id, &task.item);
 }
