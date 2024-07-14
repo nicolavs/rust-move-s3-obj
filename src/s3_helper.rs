@@ -29,7 +29,6 @@ pub async fn list_objects(
                     match object.key() {
                         None => {}
                         Some(p) => {
-                            println!("{}", &p);
                             let path = Path::new(p);
                             let filename = path.file_name().unwrap();
                             tx.send(filename.to_str().unwrap().to_string())
