@@ -3,11 +3,11 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
 use clap::Parser;
-use tokio::sync::{broadcast, mpsc};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 
-use s3_helper::list_objects;
+use s3_helper::{copy_object, delete_object, head_object, list_objects};
 
 mod s3_helper;
 
@@ -36,10 +36,23 @@ struct Args {
 // Define a task type
 #[derive(Debug, Clone)] // Add Clone derive
 struct Task {
-    item: String,
     source_bucket: String,
-    destination_path: String,
-    destination_bucket: String,
+    target_bucket: String,
+    object_key: String,
+    target_key: String,
+}
+
+#[derive(Debug, Clone)] // Add Clone derive
+struct TaskResult {
+    object_key: String,
+    status: Status,
+}
+
+#[derive(Debug, Clone)] // Add Clone derive
+enum Status {
+    Already,
+    Moved,
+    Error,
 }
 
 #[tokio::main]
@@ -51,34 +64,37 @@ async fn main() {
         .unwrap_or(args.source_bucket.clone());
 
     // Create a broadcast channel
-    let (tx, _) = broadcast::channel(100);
+    let (tx, _) = broadcast::channel(32);
     let (item_tx, mut item_rx): (Sender<String>, Receiver<String>) = mpsc::channel(100);
-
-    // Spawn worker tasks
-    let mut handles = vec![];
-    for worker_id in 0..args.num_workers {
-        let mut rx = tx.subscribe();
-        let h = task::spawn(async move {
-            while let Ok(task) = rx.recv().await {
-                process_task(worker_id, task).await;
-            }
-        });
-        handles.push(h);
-    }
+    let (result_tx, mut result_rx): (Sender<TaskResult>, Receiver<TaskResult>) = mpsc::channel(100);
 
     // Initialize the AWS SDK for Rust
     let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
         .region(Region::new(args.region_id))
         .load()
         .await;
-    let s3_client = Client::new(&config);
 
-    // List item in S3 bucket
+    // Spawn worker tasks
+    let mut handles = vec![];
+    for worker_id in 0..args.num_workers {
+        let mut rx = tx.subscribe();
+        let s3_client = Client::new(&config);
+        let tx2 = result_tx.clone();
+        let h = task::spawn(async move {
+            while let Ok(task) = rx.recv().await {
+                process_task(&s3_client, worker_id, task, &tx2).await;
+            }
+        });
+        handles.push(h);
+    }
+
+    // List file in S3 bucket
+    let s3_client = Client::new(&config);
     list_objects(
-        &s3_client,
+        s3_client,
         &args.source_bucket,
         Some(&args.source_path),
-        item_tx.clone(),
+        &item_tx,
     )
     .await
     .unwrap();
@@ -87,26 +103,81 @@ async fn main() {
     drop(item_tx);
 
     // Send tasks to workers
-    while let Some(item) = item_rx.recv().await {
+    while let Some(filename) = item_rx.recv().await {
         let task = Task {
-            item,
             source_bucket: args.source_bucket.clone(),
-            destination_path: args.destination_path.clone(),
-            destination_bucket: destination_bucket.clone(),
+            target_bucket: destination_bucket.clone(),
+            object_key: make_key(&args.source_path, &filename),
+            target_key: make_key(&args.destination_path, &filename),
         };
         tx.send(task).unwrap();
     }
 
-    // Close the channel by dropping the sender
     drop(tx);
 
     // Wait for a moment to allow workers to finish
     for h in handles {
         h.await.unwrap()
     }
+
+    drop(result_tx);
+
+    while let Some(res) = result_rx.recv().await {
+        println!("{:?}", res);
+    }
 }
 
-async fn process_task(worker_id: u8, task: Task) {
-    println!("Worker {} processing item {}", worker_id, &task.item);
-    println!("Worker {} completed item {}", worker_id, &task.item);
+async fn process_task(client: &Client, worker_id: u8, task: Task, tx: &Sender<TaskResult>) {
+    println!("Worker {} processing item {}", worker_id, &task.object_key);
+    let mut result = TaskResult {
+        object_key: task.object_key.clone(),
+        status: Status::Error,
+    };
+
+    let head_obj_response = head_object(client, &task.target_bucket, &task.target_key).await;
+    match head_obj_response {
+        Ok(head_obj) => match head_obj {
+            None => {}
+            Some(_) => {
+                // Object exist in target path
+                result.status = Status::Already;
+                tx.send(result).await.unwrap();
+            }
+        },
+        Err(_) => {
+            match copy_object(
+                client,
+                &task.source_bucket,
+                &task.target_bucket,
+                &task.object_key,
+                &task.target_key,
+            )
+            .await
+            {
+                Ok(_) => {
+                    result.status = Status::Moved;
+                    tx.send(result).await.unwrap();
+
+                    delete_object(client, &task.source_bucket, &task.object_key)
+                        .await
+                        .unwrap();
+                }
+                Err(_err) => {
+                    tx.send(result).await.unwrap();
+                }
+            }
+        }
+    }
+
+    println!("Worker {} completed item {}", worker_id, &task.object_key);
+}
+
+fn make_key(folder_path: &str, file_name: &str) -> String {
+    let mut key = "".to_string();
+    key.push_str(folder_path);
+    if !key.ends_with("/") && folder_path != "" {
+        key.push('/');
+    }
+    key.push_str(file_name);
+    key
 }
