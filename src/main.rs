@@ -1,4 +1,3 @@
-use aws_config;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
@@ -42,15 +41,15 @@ struct Task {
     target_key: String,
 }
 
-#[derive(Debug, Clone)] // Add Clone derive
+#[derive(Debug)] // Add Clone derive
 struct TaskResult {
-    object_key: String,
+    _object_key: String,
     status: Status,
 }
 
 #[derive(Debug, Clone)] // Add Clone derive
 enum Status {
-    Already,
+    AlreadyExist,
     Moved,
     Error,
 }
@@ -62,6 +61,9 @@ async fn main() {
     let destination_bucket = args
         .destination_bucket
         .unwrap_or(args.source_bucket.clone());
+
+    is_key_valid(&args.source_path).unwrap();
+    is_key_valid(&args.destination_path).unwrap();
 
     // Create a broadcast channel
     let (tx, _) = broadcast::channel(32);
@@ -75,14 +77,20 @@ async fn main() {
         .await;
 
     // Spawn worker tasks
+    let th = task::spawn(async move {
+        while let Some(res) = result_rx.recv().await {
+            println!("{:?}", res);
+        }
+    });
+
     let mut handles = vec![];
-    for worker_id in 0..args.num_workers {
+    for _ in 0..args.num_workers {
         let mut rx = tx.subscribe();
         let s3_client = Client::new(&config);
         let tx2 = result_tx.clone();
         let h = task::spawn(async move {
             while let Ok(task) = rx.recv().await {
-                process_task(&s3_client, worker_id, task, &tx2).await;
+                process_task(&s3_client, task, &tx2).await;
             }
         });
         handles.push(h);
@@ -90,7 +98,7 @@ async fn main() {
 
     // List file in S3 bucket
     let s3_client = Client::new(&config);
-    list_objects(
+    let num_of_obj = list_objects(
         s3_client,
         &args.source_bucket,
         Some(&args.source_path),
@@ -98,6 +106,7 @@ async fn main() {
     )
     .await
     .unwrap();
+    println!("Found {} object(s)", num_of_obj);
 
     // Close the channel by dropping the sender
     drop(item_tx);
@@ -122,15 +131,12 @@ async fn main() {
 
     drop(result_tx);
 
-    while let Some(res) = result_rx.recv().await {
-        println!("{:?}", res);
-    }
+    th.await.unwrap()
 }
 
-async fn process_task(client: &Client, worker_id: u8, task: Task, tx: &Sender<TaskResult>) {
-    println!("Worker {} processing item {}", worker_id, &task.object_key);
+async fn process_task(client: &Client, task: Task, tx: &Sender<TaskResult>) {
     let mut result = TaskResult {
-        object_key: task.object_key.clone(),
+        _object_key: task.object_key.clone(),
         status: Status::Error,
     };
 
@@ -140,7 +146,7 @@ async fn process_task(client: &Client, worker_id: u8, task: Task, tx: &Sender<Ta
             None => {}
             Some(_) => {
                 // Object exist in target path
-                result.status = Status::Already;
+                result.status = Status::AlreadyExist;
                 tx.send(result).await.unwrap();
             }
         },
@@ -168,16 +174,22 @@ async fn process_task(client: &Client, worker_id: u8, task: Task, tx: &Sender<Ta
             }
         }
     }
-
-    println!("Worker {} completed item {}", worker_id, &task.object_key);
 }
 
 fn make_key(folder_path: &str, file_name: &str) -> String {
     let mut key = "".to_string();
     key.push_str(folder_path);
-    if !key.ends_with("/") && folder_path != "" {
+    if !key.ends_with('/') && !folder_path.is_empty() {
         key.push('/');
     }
     key.push_str(file_name);
     key
+}
+
+fn is_key_valid(object_key: &str) -> Result<(), String> {
+    if object_key.starts_with('/') {
+        return Err(format!("Invalid path {}", object_key));
+    }
+
+    Ok(())
 }

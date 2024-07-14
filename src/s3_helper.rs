@@ -11,7 +11,8 @@ pub async fn list_objects(
     bucket: &str,
     folder_path: Option<&str>,
     tx: &Sender<String>,
-) -> Result<(), ()> {
+) -> Result<u64, ()> {
+    let mut count: u64 = 0;
     let prefix = folder_path.unwrap_or_default();
 
     let mut response = client
@@ -34,6 +35,7 @@ pub async fn list_objects(
                             tx.send(filename.to_str().unwrap().to_string())
                                 .await
                                 .unwrap();
+                            count += 1;
                         }
                     }
                 }
@@ -44,7 +46,7 @@ pub async fn list_objects(
         }
     }
 
-    Ok(())
+    Ok(count)
 }
 
 pub async fn copy_object(
