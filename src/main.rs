@@ -1,4 +1,3 @@
-use aws_config;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
@@ -42,15 +41,15 @@ struct Task {
     target_key: String,
 }
 
-#[derive(Debug, Clone)] // Add Clone derive
+#[derive(Debug)] // Add Clone derive
 struct TaskResult {
-    object_key: String,
+    _object_key: String,
     status: Status,
 }
 
 #[derive(Debug, Clone)] // Add Clone derive
 enum Status {
-    Already,
+    AlreadyExist,
     Moved,
     Error,
 }
@@ -62,6 +61,9 @@ async fn main() {
     let destination_bucket = args
         .destination_bucket
         .unwrap_or(args.source_bucket.clone());
+
+    is_key_valid(&args.source_path).unwrap();
+    is_key_valid(&args.destination_path).unwrap();
 
     // Create a broadcast channel
     let (tx, _) = broadcast::channel(32);
@@ -130,7 +132,7 @@ async fn main() {
 async fn process_task(client: &Client, worker_id: u8, task: Task, tx: &Sender<TaskResult>) {
     println!("Worker {} processing item {}", worker_id, &task.object_key);
     let mut result = TaskResult {
-        object_key: task.object_key.clone(),
+        _object_key: task.object_key.clone(),
         status: Status::Error,
     };
 
@@ -140,7 +142,7 @@ async fn process_task(client: &Client, worker_id: u8, task: Task, tx: &Sender<Ta
             None => {}
             Some(_) => {
                 // Object exist in target path
-                result.status = Status::Already;
+                result.status = Status::AlreadyExist;
                 tx.send(result).await.unwrap();
             }
         },
@@ -175,9 +177,17 @@ async fn process_task(client: &Client, worker_id: u8, task: Task, tx: &Sender<Ta
 fn make_key(folder_path: &str, file_name: &str) -> String {
     let mut key = "".to_string();
     key.push_str(folder_path);
-    if !key.ends_with("/") && folder_path != "" {
+    if !key.ends_with('/') && !folder_path.is_empty() {
         key.push('/');
     }
     key.push_str(file_name);
     key
+}
+
+fn is_key_valid(object_key: &str) -> Result<(), String> {
+    if object_key.starts_with('/') {
+        return Err(format!("Invalid path {}", object_key));
+    }
+
+    Ok(())
 }
